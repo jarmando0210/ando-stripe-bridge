@@ -1,0 +1,7 @@
+name = "ando-stripe"
+main = "worker.js"
+compatibility_date = "2026-08-01"
+
+# Dashboard → Workers → ando-stripe → Settings → Variables:
+#   STRIPE_SECRET_KEY        (sk_test_… first)
+#   STRIPE_WEBHOOK_SECRET    (whsec_… for this worker URL)
