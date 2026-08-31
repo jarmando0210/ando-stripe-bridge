@@ -1,16 +1,16 @@
-/**
- * ANDÖ Stripe bridge — Cloudflare Worker.
- * Holds STRIPE_SECRET_KEY + STRIPE_WEBHOOK_SECRET. Grok Members calls GET
- * /api/stripe?session_id=&user_id= (or user_id only) and writes the desk itself.
- */
+import http from "node:http";
+import { createHmac, timingSafeEqual } from "node:crypto";
+
+const PORT = Number(process.env.PORT || 8080);
 const CORS = {
   "access-control-allow-origin": "*",
   "access-control-allow-methods": "GET, POST, OPTIONS",
   "access-control-allow-headers": "Content-Type, Stripe-Signature, stripe-signature",
 };
 
-function json(body, status = 200) {
-  return Response.json(body, { status, headers: CORS });
+function json(res, body, status = 200) {
+  res.writeHead(status, { "content-type": "application/json", ...CORS });
+  res.end(JSON.stringify(body));
 }
 
 function stripeMode(key) {
@@ -72,27 +72,26 @@ function ownsSession(session, userId) {
   if (!userId) return false;
   if (session.metadata?.userId && session.metadata.userId !== userId) return false;
   if (session.client_reference_id && session.client_reference_id !== userId) return false;
-  return (
-    session.metadata?.userId === userId ||
-    session.client_reference_id === userId
-  );
+  return session.metadata?.userId === userId || session.client_reference_id === userId;
 }
 
 function isPaid(session) {
   if (session.status && session.status !== "complete") return false;
   if (session.payment_status === "unpaid") return false;
-  return session.payment_status === "paid" || session.payment_status === "no_amount_due" || session.status === "complete";
+  return true;
 }
 
 async function lookupSession(key, sessionId, userId) {
   const expand =
     "expand[]=subscription.default_payment_method&expand[]=setup_intent.payment_method";
   const session = await stripeGet(key, `checkout/sessions/${sessionId}?${expand}`);
-  if (!isPaid(session)) return json({ ok: false, error: "not_paid" }, 402);
-  if (userId && !ownsSession(session, userId)) return json({ ok: false, error: "wrong_account" }, 403);
+  if (!isPaid(session)) return { status: 402, body: { ok: false, error: "not_paid" } };
+  if (userId && !ownsSession(session, userId)) {
+    return { status: 403, body: { ok: false, error: "wrong_account" } };
+  }
   const uid = userId || session.metadata?.userId || session.client_reference_id;
-  if (!uid) return json({ ok: false, error: "no_user" }, 422);
-  return json(paidPayload(session, uid));
+  if (!uid) return { status: 422, body: { ok: false, error: "no_user" } };
+  return { status: 200, body: paidPayload(session, uid) };
 }
 
 async function lookupByUser(key, userId) {
@@ -101,80 +100,93 @@ async function lookupByUser(key, userId) {
     `checkout/sessions?client_reference_id=${encodeURIComponent(userId)}&limit=10`,
   );
   const session = (list.data || []).find(isPaid);
-  if (!session) return json({ ok: false, error: "not_found" }, 404);
+  if (!session) return { status: 404, body: { ok: false, error: "not_found" } };
   return lookupSession(key, session.id, userId);
 }
 
-async function verifyWebhook(raw, header, secret) {
+function verifyWebhook(raw, header, secret) {
   const parts = Object.fromEntries(
     header.split(",").map((p) => {
       const i = p.indexOf("=");
       return [p.slice(0, i).trim(), p.slice(i + 1).trim()];
     }),
   );
-  const t = parts.t;
-  const v1 = parts.v1;
-  if (!t || !v1) throw new Error("bad_header");
-  const enc = new TextEncoder();
-  const key = await crypto.subtle.importKey(
-    "raw",
-    enc.encode(secret),
-    { name: "HMAC", hash: "SHA-256" },
-    false,
-    ["sign"],
-  );
-  const sig = await crypto.subtle.sign("HMAC", key, enc.encode(`${t}.${raw}`));
-  const hex = [...new Uint8Array(sig)].map((b) => b.toString(16).padStart(2, "0")).join("");
-  if (hex.length !== v1.length) throw new Error("bad_signature");
-  let diff = 0;
-  for (let i = 0; i < hex.length; i++) diff |= hex.charCodeAt(i) ^ v1.charCodeAt(i);
-  if (diff !== 0) throw new Error("bad_signature");
+  if (!parts.t || !parts.v1) throw new Error("bad_header");
+  const digest = createHmac("sha256", secret).update(`${parts.t}.${raw}`).digest("hex");
+  const a = Buffer.from(digest);
+  const b = Buffer.from(parts.v1);
+  if (a.length !== b.length || !timingSafeEqual(a, b)) throw new Error("bad_signature");
 }
 
-export default {
-  async fetch(request, env) {
-    const url = new URL(request.url);
-    if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: CORS });
+const server = http.createServer(async (req, res) => {
+  const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
+  if (req.method === "OPTIONS") {
+    res.writeHead(204, CORS);
+    res.end();
+    return;
+  }
 
-    const key = (env.STRIPE_SECRET_KEY || "").trim();
-    const whsec = (env.STRIPE_WEBHOOK_SECRET || "").trim();
+  const key = (process.env.STRIPE_SECRET_KEY || "").trim();
+  const whsec = (process.env.STRIPE_WEBHOOK_SECRET || "").trim();
+  const path = url.pathname;
 
-    if (request.method === "GET" && (url.pathname === "/" || url.pathname === "/api/stripe")) {
+  try {
+    if (req.method === "GET" && (path === "/" || path === "/api/stripe")) {
       const sessionId = url.searchParams.get("session_id") || "";
       const userId = url.searchParams.get("user_id") || "";
       if (!key) {
-        return json({
+        json(res, {
           configured: false,
           webhook: Boolean(whsec),
           mode: "off",
           endpoint: `${url.origin}/api/stripe`,
         });
+        return;
       }
-      if (sessionId.startsWith("cs_")) return lookupSession(key, sessionId, userId);
-      if (userId) return lookupByUser(key, userId);
-      return json({
+      if (sessionId.startsWith("cs_")) {
+        const out = await lookupSession(key, sessionId, userId);
+        json(res, out.body, out.status);
+        return;
+      }
+      if (userId) {
+        const out = await lookupByUser(key, userId);
+        json(res, out.body, out.status);
+        return;
+      }
+      json(res, {
         configured: true,
         webhook: Boolean(whsec),
         mode: stripeMode(key),
         endpoint: `${url.origin}/api/stripe`,
       });
+      return;
     }
 
-    if (request.method === "POST" && (url.pathname === "/" || url.pathname === "/api/stripe")) {
-      if (!key) return json({ error: "Stripe is not connected" }, 503);
-      if (!whsec) return json({ error: "Stripe webhook secret is not set" }, 503);
-      const signature = request.headers.get("stripe-signature") || "";
-      if (!signature) return json({ error: "Missing Stripe-Signature" }, 401);
-      const raw = await request.text();
+    if (req.method === "POST" && (path === "/" || path === "/api/stripe")) {
+      if (!key) return json(res, { error: "Stripe is not connected" }, 503);
+      if (!whsec) return json(res, { error: "Stripe webhook secret is not set" }, 503);
+      const signature = req.headers["stripe-signature"] || "";
+      if (!signature) return json(res, { error: "Missing Stripe-Signature" }, 401);
+      const chunks = [];
+      for await (const c of req) chunks.push(c);
+      const raw = Buffer.concat(chunks).toString("utf8");
       try {
-        await verifyWebhook(raw, signature, whsec);
+        verifyWebhook(raw, String(signature), whsec);
       } catch {
-        return json({ error: "bad_signature" }, 401);
+        json(res, { error: "bad_signature" }, 401);
+        return;
       }
       const event = JSON.parse(raw);
-      return json({ received: true, type: event.type });
+      json(res, { received: true, type: event.type });
+      return;
     }
 
-    return json({ error: "Not found" }, 404);
-  },
-};
+    json(res, { error: "Not found" }, 404);
+  } catch (err) {
+    json(res, { error: err instanceof Error ? err.message : "bridge_error" }, 500);
+  }
+});
+
+server.listen(PORT, "0.0.0.0", () => {
+  console.log(`ando-stripe bridge on :${PORT}`);
+});
